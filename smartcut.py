@@ -30,6 +30,7 @@ EPS = 0.0005
 CRF = 18
 PRESET = "medium"
 AUDIO_BITRATE = "192k"
+OUTPUT_EXTS = (".mp4", ".mkv", ".mov")
 
 console = Console(highlight=False)
 err_console = Console(stderr=True, highlight=False)
@@ -161,6 +162,7 @@ def run_ffmpeg(cmd, total):
     except BaseException:
         p.kill()
         p.wait()
+        errf.close()
         raise
 
     errf.seek(0)
@@ -178,6 +180,15 @@ def ffmpeg(*args, label, total, out=None):
         die(f"ffmpeg produced an empty segment ({os.path.basename(out)}). "
             "Seeking in this input is probably unreliable (common with .ts/mpegts). "
             "Remux it first, e.g.: ffmpeg -i input.ts -c copy input.mkv")
+
+
+def ffmpeg_options():
+    out = run(["ffmpeg", "-hide_banner", "-h", "long"], capture=True)
+    return out if out and out.count("\n") > 20 else None
+
+
+def has_option(options, name):
+    return options is None or re.search(rf"^\s*-{name}\b", options, re.M) is not None
 
 
 def probe(path):
@@ -361,21 +372,22 @@ def print_summary(outp, out_dur, target, elapsed):
                         expand=False))
 
 
-def smartcut(inp, outp, start, end):
+def smartcut(inp, outp, start, end, opts):
     video, has_audio, duration, fstart = probe(inp)
     codec = video.get("codec_name")
     vmap = f"0:{video['index']}"
     rotation = get_rotation(video)
-
     ext = os.path.splitext(outp)[1].lower()
-    if ext not in (".mp4", ".mkv", ".mov"):
-        die("output extension must be .mp4, .mkv, or .mov")
+
+    if rotation and not has_option(opts, "display_rotation"):
+        die("this video is rotated, which requires a newer ffmpeg "
+            "(option -display_rotation is missing), please upgrade ffmpeg")
+
     if duration and start >= duration:
         die(f"start ({fmt_time(start)}) is beyond the video duration ({fmt_time(duration)})")
-    if start >= end:
-        die("start time must be earlier than end time")
     if duration and end > duration:
         info(f"End exceeds video duration, clamped to {fmt_time(duration)}")
+
     enc = build_encoder_args(video)
     smart_ok = enc is not None
     if enc is None:
@@ -384,7 +396,6 @@ def smartcut(inp, outp, start, end):
 
     pkts = None
     if smart_ok:
-        info("Reading frame/keyframe list...")
         pkts = get_packets(inp, video["index"], fstart)
         if pkts is None:
             smart_ok = False
@@ -407,8 +418,11 @@ def smartcut(inp, outp, start, end):
         if plan is None:
             s_eff, e_eff = start, (min(end, duration) if duration else end)
             ts = os.path.join(tmp, "full.ts")
-            ffmpeg("-noautorotate", "-ss", sec(max(0, s_eff - EPS)), "-i", inp,
-                   "-t", sec(e_eff - s_eff), "-map", vmap, "-an", *enc,
+            seek = max(0, s_eff - EPS)
+            rel_end = e_eff - seek
+            ffmpeg("-noautorotate", "-ss", sec(seek), "-i", inp,
+                   "-t", sec(rel_end + 1), "-vf", f"trim=end={sec(rel_end)}",
+                   "-map", vmap, "-an", *enc,
                    "-fps_mode", "passthrough", "-f", "mpegts", ts,
                    label="Re-encoding the whole range...", total=e_eff - s_eff, out=ts)
             segments.append((ts, None))
@@ -480,7 +494,10 @@ def smartcut(inp, outp, start, end):
         out_tmp = os.path.join(tmp, "output" + ext)
         mux += ["-avoid_negative_ts", "make_zero", out_tmp]
         ffmpeg(*mux, label="Merging all segments...", total=e_eff - s_eff)
-        os.replace(out_tmp, outp)
+        try:
+            os.replace(out_tmp, outp)
+        except OSError as e:
+            die(f"cannot write output file (is it open in another program?): {e}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -493,9 +510,6 @@ def smartcut(inp, outp, start, end):
 
 
 PROG = os.path.basename(sys.argv[0]) or "smartcut.py"
-PY = os.path.basename(sys.executable) or "python"
-if PY.lower().endswith(".exe"):
-    PY = PY[:-4]
 
 HELP_TEXT = f"""\
 Usage: {PROG} [OPTION]... -s TIME -e TIME FILE
@@ -506,8 +520,8 @@ Usage: {PROG} [OPTION]... -s TIME -e TIME FILE
   -h, --help           display this help and exit
 
 Examples:
-  {PY} {PROG} video.mp4 -s 00:01:30 -e 00:05:45
-  {PY} {PROG} video.mkv -s 00:00:10.5 -e 00:00:42 -o clip.mkv
+  python {PROG} video.mp4 -s 00:01:30 -e 00:05:45
+  python {PROG} video.mkv -s 00:00:10.5 -e 00:00:42 -o clip.mkv
 """
 
 
@@ -544,16 +558,24 @@ def main():
         die(f"file not found: {args.input}")
 
     base, ext = os.path.splitext(args.input)
-    out_ext = ext if ext.lower() in (".mp4", ".mkv", ".mov") else ".mp4"
+    out_ext = ext if ext.lower() in OUTPUT_EXTS else ".mp4"
     outp = os.path.abspath(args.output or f"{base}_cut{out_ext}")
     inp = os.path.abspath(args.input)
     if not os.path.isdir(os.path.dirname(outp)):
         die(f"output directory does not exist: {os.path.dirname(outp)}")
+    if os.path.splitext(outp)[1].lower() not in OUTPUT_EXTS:
+        die("output extension must be .mp4, .mkv, or .mov")
+    if args.start >= args.end:
+        die("start time must be earlier than end time")
 
-    for sig_name in ("SIGTERM", "SIGHUP"):  # SIGHUP is missing on Windows
-        sig = getattr(signal, sig_name, None)
-        if sig is not None:
-            signal.signal(sig, on_signal)
+    opts = ffmpeg_options()
+    if not has_option(opts, "fps_mode"):
+        die("this ffmpeg is too old (option -fps_mode is missing), please upgrade ffmpeg")
+
+    signal.signal(signal.SIGTERM, on_signal)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, on_signal)
+
     try:
         if os.path.exists(outp):
             if os.path.samefile(outp, inp):
@@ -563,7 +585,7 @@ def main():
             if not Confirm.ask(f"[bold yellow]WARN[/]  {escape(outp)} already exists. Overwrite?",
                                default=False, console=console):
                 die("aborted")
-        smartcut(inp, outp, args.start, args.end)
+        smartcut(inp, outp, args.start, args.end, opts)
     except KeyboardInterrupt:
         console.print()
         die("interrupted")
