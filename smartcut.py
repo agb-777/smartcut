@@ -27,8 +27,8 @@ except ImportError:
     sys.exit(1)
 
 EPS = 0.0005
-CRF = 18
-PRESET = "medium"
+CRF = 20
+PRESET = "ultrafast"
 AUDIO_BITRATE = "192k"
 OUTPUT_EXTS = (".mp4", ".mkv", ".mov")
 
