@@ -493,6 +493,9 @@ def smartcut(inp, outp, start, end):
 
 
 PROG = os.path.basename(sys.argv[0]) or "smartcut.py"
+PY = os.path.basename(sys.executable) or "python"
+if PY.lower().endswith(".exe"):
+    PY = PY[:-4]
 
 HELP_TEXT = f"""\
 Usage: {PROG} [OPTION]... -s TIME -e TIME FILE
@@ -503,8 +506,8 @@ Usage: {PROG} [OPTION]... -s TIME -e TIME FILE
   -h, --help           display this help and exit
 
 Examples:
-  {PROG} video.mp4 -s 00:01:30 -e 00:05:45
-  {PROG} video.mkv -s 00:00:10.5 -e 00:00:42 -o clip.mkv
+  {PY} {PROG} video.mp4 -s 00:01:30 -e 00:05:45
+  {PY} {PROG} video.mkv -s 00:00:10.5 -e 00:00:42 -o clip.mkv
 """
 
 
