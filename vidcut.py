@@ -9,11 +9,30 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import nullcontext
+
+try:
+    from rich import box
+    from rich.console import Console
+    from rich.markup import escape
+    from rich.panel import Panel
+    from rich.progress import (BarColumn, Progress, TaskProgressColumn,
+                               TextColumn, TimeElapsedColumn,
+                               TimeRemainingColumn)
+    from rich.prompt import Confirm
+    from rich.table import Table
+except ImportError:
+    print("[ERROR] module 'rich' not found, install with: pip install rich",
+          file=sys.stderr)
+    sys.exit(1)
 
 EPS = 0.0005
 CRF = 18
 PRESET = "medium"
 AUDIO_BITRATE = "192k"
+
+console = Console(highlight=False)
+err_console = Console(stderr=True, highlight=False)
 
 H264_PROFILES = {
     "baseline": "baseline",
@@ -36,12 +55,16 @@ def on_signal(signum, frame):
 
 
 def die(msg):
-    print(f"[ERROR] {msg}", file=sys.stderr)
+    err_console.print(f"[bold red]ERROR[/] {escape(msg)}", soft_wrap=True)
     sys.exit(1)
 
 
 def info(msg):
-    print(f"[INFO] {msg}")
+    console.print(f"[bold cyan]INFO[/]  {escape(msg)}", soft_wrap=True)
+
+
+def step(msg):
+    console.print(f"[bold magenta]>>[/]    {escape(msg)}", soft_wrap=True)
 
 
 def parse_time(value):
@@ -73,36 +96,26 @@ def fmt_size(path):
         n /= 1024
 
 
-def fmt_eta(seconds):
-    seconds = int(max(0, seconds))
-    return f"{seconds // 60:02d}:{seconds % 60:02d}"
-
-
 def sec(x):
     return f"{x:.6f}"
 
 
 def run(cmd, capture=False, spinner=None):
-    t0 = time.time()
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, errors="replace")
     except FileNotFoundError:
         die(f"command not found: {cmd[0]}")
-    frames = "|/-\\"
-    i = 0
-    while True:
-        try:
-            out, err = proc.communicate(timeout=0.5)
-            break
-        except subprocess.TimeoutExpired:
-            if spinner and sys.stdout.isatty():
-                sys.stdout.write(f"\r      {frames[i % 4]} {spinner} {time.time() - t0:.0f}s")
-                sys.stdout.flush()
-                i += 1
-    if spinner and sys.stdout.isatty():
-        sys.stdout.write("\r" + " " * 70 + "\r")
-        sys.stdout.flush()
+
+    ctx = console.status(spinner, spinner="dots") if spinner else nullcontext()
+    try:
+        with ctx:
+            out, err = proc.communicate()
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+
     if proc.returncode != 0:
         tail = "\n".join(err.strip().splitlines()[-15:])
         die(f"command failed: {' '.join(cmd)}\n{tail}")
@@ -118,49 +131,42 @@ def run_ffmpeg(cmd, total=None):
     except FileNotFoundError:
         die(f"command not found: {cmd[0]}")
 
-    tty = sys.stdout.isatty()
-    t0 = time.time()
-    cur, speed, next_mark = 0.0, "", 10
-    width = 24
-
-    def render(final=False):
-        nonlocal next_mark
-        if not total or total <= 0:
-            return
-        pct = 100.0 if final else min(99.9, max(0.0, cur / total * 100))
-        elapsed = time.time() - t0
-        eta = elapsed * (total - cur) / cur if cur > 0 and not final else 0
-        filled = int(width * pct / 100)
-        bar = "#" * filled + "-" * (width - filled)
-        extra = f"  speed {speed}" if speed and speed != "N/A" else ""
-        text = f"      [{bar}] {pct:5.1f}%{extra}  ETA {fmt_eta(eta)}"
-        if tty:
-            sys.stdout.write("\r" + text.ljust(79))
-            sys.stdout.flush()
-        elif pct >= next_mark or final:
-            print(text)
-            next_mark = (int(pct) // 10 + 1) * 10
+    has_total = bool(total and total > 0)
+    progress = Progress(
+        TextColumn("     "),
+        BarColumn(bar_width=28),
+        TaskProgressColumn(),
+        TextColumn("[dim]{task.fields[speed]:>7}[/]"),
+        TextColumn("[dim]elapsed[/]"),
+        TimeElapsedColumn(),
+        TextColumn("[dim]ETA[/]"),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+    )
 
     try:
-        for line in p.stdout:
-            key, _, val = line.strip().partition("=")
-            if key in ("out_time_us", "out_time_ms"):
-                try:
-                    cur = max(0.0, int(val) / 1e6)
-                except ValueError:
-                    continue
-            elif key == "speed":
-                speed = val.strip()
-            elif key == "progress":
-                render(final=(val == "end"))
-        p.wait()
+        with progress:
+            task = progress.add_task("", total=total if has_total else None, speed="")
+            for line in p.stdout:
+                key, _, val = line.strip().partition("=")
+                if key in ("out_time_us", "out_time_ms") and has_total:
+                    try:
+                        cur = max(0.0, int(val) / 1e6)
+                    except ValueError:
+                        continue
+                    progress.update(task, completed=min(total, cur))
+                elif key == "speed":
+                    sp = val.strip()
+                    progress.update(task, speed="" if sp == "N/A" else sp)
+                elif key == "progress" and val == "end" and has_total:
+                    progress.update(task, completed=total)
+            p.wait()
     except BaseException:
         p.kill()
         p.wait()
         raise
-    if tty and total:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+
     errf.seek(0)
     err = errf.read()
     errf.close()
@@ -169,10 +175,14 @@ def run_ffmpeg(cmd, total=None):
         die(f"command failed: {' '.join(cmd)}\n{tail}")
 
 
-def ffmpeg(*args, label=None, total=None):
+def ffmpeg(*args, label=None, total=None, out=None):
     if label:
-        info(label)
+        step(label)
     run_ffmpeg(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args], total)
+    if out and (not os.path.exists(out) or os.path.getsize(out) == 0):
+        die(f"ffmpeg produced an empty segment ({os.path.basename(out)}). "
+            "Seeking in this input is probably unreliable (common with .ts/mpegts). "
+            "Remux it first, e.g.: ffmpeg -i input.ts -c copy input.mkv")
 
 
 def probe(path):
@@ -322,6 +332,41 @@ def make_plan(pkts, start, end):
                 c_len=max(0.0, c_len), b_packets=b_packets)
 
 
+def print_plan(start, end, plan):
+    table = Table(title="Smartcut Plan", box=box.ROUNDED, title_style="bold",
+                  caption=(f"Start {fmt_time(start)} -> frame {fmt_time(plan['s_eff'])}   |   "
+                           f"End {fmt_time(end)} -> frame {fmt_time(plan['e_eff'])}"),
+                  caption_style="dim")
+    table.add_column("Segment", justify="center", style="bold")
+    table.add_column("Mode")
+    table.add_column("Range")
+    table.add_column("Duration", justify="right")
+
+    s_eff, e_eff = plan["s_eff"], plan["e_eff"]
+    k1, k2 = plan["k1"], plan["k2"]
+    if plan["a_len"] > EPS:
+        table.add_row("A", "[yellow]re-encode[/]",
+                      f"{fmt_time(s_eff)} - {fmt_time(k1)}", f"{plan['a_len']:.3f}s")
+    table.add_row("B", "[green]copy[/]",
+                  f"{fmt_time(k1)} - {fmt_time(k2)}", f"{plan['b_len']:.3f}s")
+    if plan["c_len"] > EPS:
+        table.add_row("C", "[yellow]re-encode[/]",
+                      f"{fmt_time(k2)} - {fmt_time(e_eff)}", f"{plan['c_len']:.3f}s")
+    console.print(table)
+
+
+def print_summary(outp, out_dur, target, elapsed):
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold")
+    grid.add_column()
+    grid.add_row("Output", escape(outp))
+    grid.add_row("Duration", f"{fmt_time(out_dur)} [dim](target {fmt_time(target)})[/]")
+    grid.add_row("Size", fmt_size(outp))
+    grid.add_row("Time", f"{elapsed:.1f}s")
+    console.print(Panel(grid, title="[bold green]Done[/]", border_style="green",
+                        expand=False))
+
+
 def smartcut(inp, outp, start, end):
     video, has_audio, duration, fstart = probe(inp)
     codec = video.get("codec_name")
@@ -368,16 +413,13 @@ def smartcut(inp, outp, start, end):
             ffmpeg("-noautorotate", "-ss", sec(max(0, s_eff - EPS)), "-i", inp,
                    "-t", sec(e_eff - s_eff), "-map", vmap, "-an", *enc,
                    "-fps_mode", "passthrough", "-f", "mpegts", ts,
-                   label="Re-encoding the whole range...", total=e_eff - s_eff)
+                   label="Re-encoding the whole range...", total=e_eff - s_eff, out=ts)
             segments.append((ts, None))
         else:
             s_eff, e_eff = plan["s_eff"], plan["e_eff"]
             k1, k2 = plan["k1"], plan["k2"]
             a_len, c_len = plan["a_len"], plan["c_len"]
-            info(f"Start : {fmt_time(start)} (nearest frame: {fmt_time(s_eff)})")
-            info(f"End   : {fmt_time(end)} (nearest frame: {fmt_time(e_eff)})")
-            info(f"Segment A (re-encode): {a_len:.3f}s | B (copy): {plan['b_len']:.3f}s | "
-                 f"C (re-encode): {c_len:.3f}s")
+            print_plan(start, end, plan)
 
             if a_len > EPS:
                 ts_a = os.path.join(tmp, "a.ts")
@@ -385,7 +427,7 @@ def smartcut(inp, outp, start, end):
                        "-t", sec(a_len), "-map", vmap, "-an", *enc,
                        "-fps_mode", "passthrough", "-f", "mpegts", ts_a,
                        label=f"[A] Re-encoding {a_len:.3f}s (start to first keyframe)...",
-                       total=a_len)
+                       total=a_len, out=ts_a)
                 segments.append((ts_a, a_len))
 
             ts_b = os.path.join(tmp, "b.ts")
@@ -398,7 +440,7 @@ def smartcut(inp, outp, start, end):
                 b_cmd += ["-bsf:v", bsf]
             b_cmd += ["-avoid_negative_ts", "make_zero", "-f", "mpegts", ts_b]
             ffmpeg(*b_cmd, label=f"[B] Copying {plan['b_len']:.3f}s without re-encode...",
-                   total=plan["b_len"])
+                   total=plan["b_len"], out=ts_b)
             segments.append((ts_b, plan["b_len"]))
 
             if c_len > EPS:
@@ -407,13 +449,13 @@ def smartcut(inp, outp, start, end):
                        "-t", sec(c_len), "-map", vmap, "-an", *enc,
                        "-fps_mode", "passthrough", "-f", "mpegts", ts_c,
                        label=f"[C] Re-encoding {c_len:.3f}s (last keyframe to end)...",
-                       total=c_len)
+                       total=c_len, out=ts_c)
                 segments.append((ts_c, c_len))
 
         list_path = os.path.join(tmp, "list.txt")
         with open(list_path, "w") as f:
             for path, dur in segments:
-                f.write(f"file '{path}'\n")
+                f.write("file '{}'\n".format(path.replace("'", "'\\''")))
                 if dur is not None:
                     f.write(f"duration {dur:.6f}\n")
 
@@ -448,15 +490,14 @@ def smartcut(inp, outp, start, end):
     out_dur = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                    "-of", "csv=p=0", outp], capture=True).strip()
     try:
-        info(f"Output duration: {fmt_time(float(out_dur))} "
-             f"(target {fmt_time(e_eff - s_eff)}), size {fmt_size(outp)}")
+        print_summary(outp, float(out_dur), e_eff - s_eff, time.time() - t_start)
     except ValueError:
-        pass
-    info(f"Done -> {outp} (total {time.time() - t_start:.1f}s)")
+        info(f"Done -> {outp} (total {time.time() - t_start:.1f}s)")
 
 
 def main():
     ap = argparse.ArgumentParser(
+        prog="smartcut",
         description="Frame-accurate video cutting with ffmpeg using the smartcut method."
     )
     ap.add_argument("input", help="input video file")
@@ -480,20 +521,23 @@ def main():
     inp = os.path.abspath(args.input)
     if not os.path.isdir(os.path.dirname(outp)):
         die(f"output directory does not exist: {os.path.dirname(outp)}")
-    if os.path.exists(outp):
-        if os.path.samefile(outp, inp):
-            die("output must not be the same file as input")
-        if not sys.stdin.isatty():
-            die(f"output file already exists: {outp}")
-        if input(f"[WARN] {outp} already exists. Overwrite? [y/N]: ").strip().lower() != "y":
-            die("aborted")
 
-    signal.signal(signal.SIGTERM, on_signal)
-    signal.signal(signal.SIGHUP, on_signal)
+    for sig_name in ("SIGTERM", "SIGHUP"):  # SIGHUP is missing on Windows
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            signal.signal(sig, on_signal)
     try:
+        if os.path.exists(outp):
+            if os.path.samefile(outp, inp):
+                die("output must not be the same file as input")
+            if not sys.stdin.isatty():
+                die(f"output file already exists: {outp}")
+            if not Confirm.ask(f"[bold yellow]WARN[/]  {escape(outp)} already exists. Overwrite?",
+                               default=False, console=console):
+                die("aborted")
         smartcut(inp, outp, args.start, args.end)
     except KeyboardInterrupt:
-        print()
+        console.print()
         die("interrupted")
 
 
