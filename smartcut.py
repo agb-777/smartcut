@@ -101,11 +101,8 @@ def sec(x):
 
 
 def run(cmd, capture=False, spinner=None):
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, errors="replace")
-    except FileNotFoundError:
-        die(f"command not found: {cmd[0]}")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, errors="replace")
 
     ctx = console.status(spinner, spinner="dots") if spinner else nullcontext()
     try:
@@ -122,16 +119,12 @@ def run(cmd, capture=False, spinner=None):
     return out if capture else None
 
 
-def run_ffmpeg(cmd, total=None):
+def run_ffmpeg(cmd, total):
     full = [cmd[0], "-nostdin", "-progress", "pipe:1", "-nostats", *cmd[1:]]
     errf = tempfile.TemporaryFile(mode="w+", errors="replace")
-    try:
-        p = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=errf,
-                             text=True, errors="replace")
-    except FileNotFoundError:
-        die(f"command not found: {cmd[0]}")
+    p = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=errf,
+                         text=True, errors="replace")
 
-    has_total = bool(total and total > 0)
     progress = Progress(
         TextColumn("     "),
         BarColumn(bar_width=28),
@@ -147,19 +140,22 @@ def run_ffmpeg(cmd, total=None):
 
     try:
         with progress:
-            task = progress.add_task("", total=total if has_total else None, speed="")
+            task = progress.add_task("", total=total, speed="")
             for line in p.stdout:
                 key, _, val = line.strip().partition("=")
-                if key in ("out_time_us", "out_time_ms") and has_total:
+                if key in ("out_time_us", "out_time_ms"):
                     try:
                         cur = max(0.0, int(val) / 1e6)
                     except ValueError:
                         continue
                     progress.update(task, completed=min(total, cur))
                 elif key == "speed":
-                    sp = val.strip()
-                    progress.update(task, speed="" if sp == "N/A" else sp)
-                elif key == "progress" and val == "end" and has_total:
+                    try:
+                        x = float(val.strip().rstrip("x"))
+                        progress.update(task, speed=f"{x:.2f}x" if x < 10 else f"{x:.0f}x")
+                    except ValueError:
+                        progress.update(task, speed="")
+                elif key == "progress" and val == "end":
                     progress.update(task, completed=total)
             p.wait()
     except BaseException:
@@ -175,9 +171,8 @@ def run_ffmpeg(cmd, total=None):
         die(f"command failed: {' '.join(cmd)}\n{tail}")
 
 
-def ffmpeg(*args, label=None, total=None, out=None):
-    if label:
-        step(label)
+def ffmpeg(*args, label, total, out=None):
+    step(label)
     run_ffmpeg(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args], total)
     if out and (not os.path.exists(out) or os.path.getsize(out) == 0):
         die(f"ffmpeg produced an empty segment ({os.path.basename(out)}). "
@@ -334,8 +329,7 @@ def make_plan(pkts, start, end):
 
 def print_plan(start, end, plan):
     table = Table(title="Smartcut Plan", box=box.ROUNDED, title_style="bold",
-                  caption=(f"Start {fmt_time(start)} -> frame {fmt_time(plan['s_eff'])}   |   "
-                           f"End {fmt_time(end)} -> frame {fmt_time(plan['e_eff'])}"),
+                  caption=f"requested {fmt_time(start)} - {fmt_time(end)}",
                   caption_style="dim")
     table.add_column("Segment", justify="center", style="bold")
     table.add_column("Mode")
@@ -402,7 +396,10 @@ def smartcut(inp, outp, start, end):
         if plan is None:
             info("Range too short or no suitable closed keyframe, re-encoding this range only")
 
-    tmp = tempfile.mkdtemp(prefix=".smartcut_", dir=os.path.dirname(outp))
+    try:
+        tmp = tempfile.mkdtemp(prefix=".smartcut_", dir=os.path.dirname(outp))
+    except OSError as e:
+        die(f"cannot write to output directory: {e}")
     t_start = time.time()
     try:
         segments = []
@@ -495,18 +492,46 @@ def smartcut(inp, outp, start, end):
         info(f"Done -> {outp} (total {time.time() - t_start:.1f}s)")
 
 
+PROG = os.path.basename(sys.argv[0]) or "smartcut.py"
+
+HELP_TEXT = f"""\
+Usage: {PROG} [OPTION]... -s TIME -e TIME FILE
+
+  -s, --start=TIME     start time, HH:MM:SS[.mmm]
+  -e, --end=TIME       end time, HH:MM:SS[.mmm]
+  -o, --output=FILE    output file (.mp4, .mkv or .mov)
+  -h, --help           display this help and exit
+
+Examples:
+  {PROG} video.mp4 -s 00:01:30 -e 00:05:45
+  {PROG} video.mkv -s 00:00:10.5 -e 00:00:42 -o clip.mkv
+"""
+
+
+class HelpAction(argparse.Action):
+    def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                 default=argparse.SUPPRESS, help=None):
+        super().__init__(option_strings, dest=dest, default=default,
+                         nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        sys.stdout.write(HELP_TEXT)
+        parser.exit()
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, f"{self.prog}: {message}\n"
+                     f"Try '{self.prog} --help' for more information.\n")
+
+
 def main():
-    ap = argparse.ArgumentParser(
-        prog="smartcut",
-        description="Frame-accurate video cutting with ffmpeg using the smartcut method."
-    )
-    ap.add_argument("input", help="input video file")
-    ap.add_argument("-s", "--start", type=parse_time, required=True,
-                    help="start time, HH:MM:SS (e.g. 00:01:30)")
-    ap.add_argument("-e", "--end", type=parse_time, required=True,
-                    help="end time, HH:MM:SS (e.g. 00:05:45)")
-    ap.add_argument("-o", "--output",
-                    help="output file (.mp4/.mkv/.mov), default: <name>_cut<ext>")
+    ap = Parser(prog=PROG, add_help=False)
+    ap.add_argument("input")
+    ap.add_argument("-s", "--start", type=parse_time, required=True)
+    ap.add_argument("-e", "--end", type=parse_time, required=True)
+    ap.add_argument("-o", "--output")
+    ap.add_argument("-h", "--help", action=HelpAction)
     args = ap.parse_args()
 
     for tool in ("ffmpeg", "ffprobe"):
